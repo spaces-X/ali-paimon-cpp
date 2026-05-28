@@ -15,6 +15,7 @@ set(PAIMON_TANTIVY_SUPPORT_SRCS
     tantivy_stream_ctx.cpp
     tantivy_global_index_writer.cpp
     tantivy_global_index_reader.cpp
+    tantivy_reader_cache.cpp
     tantivy_global_index.cpp
     tantivy_global_index_factory.cpp
 )
@@ -45,6 +46,15 @@ if(PAIMON_BUILD_TESTS)
                     tantivy_smoke_test.cpp
                     STATIC_LINK_LIBS
                     paimon_tantivy_ffi
+                    ${GTEST_LINK_TOOLCHAIN})
+
+    # L1 — LRU cache mechanics. Stubbed with shared_ptr<int> so no archive
+    # fixtures needed; real reader caching is covered by tantivy_reader_test.
+    add_paimon_test(tantivy_reader_cache_test
+                    SOURCES
+                    tantivy_reader_cache_test.cpp
+                    tantivy_reader_cache.cpp
+                    STATIC_LINK_LIBS
                     ${GTEST_LINK_TOOLCHAIN})
 
     add_paimon_test(tantivy_ffi_test

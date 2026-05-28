@@ -12,6 +12,7 @@
 
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 
 #include "paimon/global_index/bitmap_scored_global_index_result.h"
@@ -116,7 +117,12 @@ class TantivyGlobalIndexReader : public GlobalIndexReader {
     /// Owning handle to the Rust-side reader.
     ReaderPtr reader_;
     /// MemoryPool used for serializing pre-filter bitmaps to bytes for FFI.
+    /// Cached readers bind to the process-wide default pool so the pool
+    /// outlives any single query (caller pool is query-scoped).
     std::shared_ptr<MemoryPool> pool_;
+    /// Serializes VisitFullTextSearch since the same cached reader may be
+    /// reused across BE workers (FFI handle is not thread-safe).
+    mutable std::mutex visit_mu_;
 };
 
 }  // namespace paimon::tantivy

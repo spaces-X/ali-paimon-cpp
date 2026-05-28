@@ -25,7 +25,9 @@
 #include "paimon/global_index/tantivy/tantivy_archive_layout.h"
 #include "paimon/global_index/tantivy/tantivy_ffi_log.h"  // [BUG_QPLEAK_RUST]
 #include "paimon/global_index/tantivy/tantivy_ffi_status.h"
+#include "paimon/global_index/tantivy/tantivy_reader_cache.h"  // [L1]
 #include "paimon/global_index/tantivy/tantivy_stream_ctx.h"
+#include "paimon/memory/memory_pool.h"
 
 namespace paimon::tantivy {
 
@@ -62,7 +64,18 @@ Result<std::shared_ptr<TantivyGlobalIndexReader>> TantivyGlobalIndexReader::Crea
     const std::shared_ptr<GlobalIndexFileReader>& file_reader,
     const std::map<std::string, std::string>& options, const std::shared_ptr<MemoryPool>& pool) {
     (void)field_name;  // Rust-side knows the field via the schema embedded in meta.json
+    (void)pool;        // [L1] cached readers use GetDefaultPool() — caller pool is query-scoped
     EnsureTantivyLogBridge();  // [BUG_QPLEAK_RUST]
+
+    // [L1] Cache lookup: paimon $global_index files are immutable per snapshot,
+    // so file_path uniquely identifies content.
+    auto& cache = TantivyReaderCache::Instance().Lru();
+    if (auto cached = cache.Lookup(io_meta.file_path)) {
+        LOG(INFO) << "[PROF_FFI] create_cached archive=" << io_meta.file_path
+                  << " hits=" << cache.Hits() << " misses=" << cache.Misses()
+                  << " cache_size=" << cache.Size();
+        return cached;
+    }
 
     // [PROF_FFI] L0: time the C++-side Create() so we can attribute
     // GetInputStream + ParseArchiveHeader separately from the Rust-side
@@ -155,14 +168,17 @@ Result<std::shared_ptr<TantivyGlobalIndexReader>> TantivyGlobalIndexReader::Crea
     const double create_total_ms = std::chrono::duration<double, std::milli>(
                                        std::chrono::steady_clock::now() - t_create_start)
                                        .count();
+    auto r = std::shared_ptr<TantivyGlobalIndexReader>(
+        new TantivyGlobalIndexReader(ReaderPtr(raw), GetDefaultPool()));
+    cache.Insert(io_meta.file_path, r);
     LOG(INFO) << "[PROF_FFI] create archive=" << io_meta.file_path
               << " file_count=" << layout.count
               << " get_stream_ms=" << get_stream_ms
               << " parse_header_ms=" << parse_header_ms
               << " ffi_new_ms=" << ffi_new_ms
-              << " total_ms=" << create_total_ms;
-    return std::shared_ptr<TantivyGlobalIndexReader>(
-        new TantivyGlobalIndexReader(ReaderPtr(raw), pool));
+              << " total_ms=" << create_total_ms
+              << " cache_size=" << cache.Size();
+    return r;
 }
 
 Result<std::shared_ptr<GlobalIndexResult>> TantivyGlobalIndexReader::VisitFullTextSearch(
@@ -170,6 +186,9 @@ Result<std::shared_ptr<GlobalIndexResult>> TantivyGlobalIndexReader::VisitFullTe
     if (!full_text_search) {
         return Status::Invalid("VisitFullTextSearch: null FullTextSearch pointer");
     }
+    // [L1] cached reader may be reused across BE workers; FFI handle is not
+    // safe for concurrent search, serialize here.
+    std::lock_guard<std::mutex> guard(visit_mu_);
 
     // Serialize pre_filter (if any) to croaring portable bytes for FFI.
     // NB: Serialize() returns a pooled_unique_ptr with MemoryPool::AllocatorDelete;
