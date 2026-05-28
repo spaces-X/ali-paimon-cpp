@@ -24,7 +24,9 @@ use std::fmt;
 use std::io;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use tantivy::directory::error::{DeleteError, LockError, OpenReadError, OpenWriteError};
 use tantivy::directory::{
@@ -81,6 +83,32 @@ impl Drop for CallbackCtx {
 unsafe impl Send for CallbackCtx {}
 unsafe impl Sync for CallbackCtx {}
 
+// [PROF_FFI] L0 profile: per-directory IO counters. Lives in Arc<DirStats> so
+// it survives Directory clones; on last drop emits one summary `log::info!`
+// line for offline ms / read-count attribution.
+static NEXT_DIR_ID: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) struct DirStats {
+    pub dir_id: u64,
+    pub read_count: AtomicU64,
+    pub read_bytes: AtomicU64,
+    pub read_ns: AtomicU64,
+    pub lock_wait_ns: AtomicU64,
+}
+
+impl Drop for DirStats {
+    fn drop(&mut self) {
+        log::info!(
+            "[PROF_FFI] dir_drop dir_id={} reads={} bytes={} read_ns={} lock_wait_ns={}",
+            self.dir_id,
+            self.read_count.load(Ordering::Relaxed),
+            self.read_bytes.load(Ordering::Relaxed),
+            self.read_ns.load(Ordering::Relaxed),
+            self.lock_wait_ns.load(Ordering::Relaxed),
+        );
+    }
+}
+
 // =========================================================================
 // PaimonCallbackDirectory
 // =========================================================================
@@ -98,6 +126,8 @@ pub struct PaimonCallbackDirectory {
     /// V3 保守路线:串行 seek+read(对齐 Java JniDir `stream_lock`)。
     /// V3.5 升级去掉此锁,见 `tantivy_directory_upgrade_plan.md` §5。
     stream_mutex: Arc<Mutex<()>>,
+    /// [PROF_FFI] L0 IO accounting; outlives clones until last drop.
+    stats: Arc<DirStats>,
 }
 
 impl fmt::Debug for PaimonCallbackDirectory {
@@ -120,24 +150,56 @@ impl PaimonCallbackDirectory {
         for (name, offset, length) in entries {
             layout.insert(PathBuf::from(name), FileMeta { offset, length });
         }
+        let dir_id = NEXT_DIR_ID.fetch_add(1, Ordering::Relaxed);
+        log::info!(
+            "[PROF_FFI] dir_new dir_id={} file_count={}",
+            dir_id,
+            layout.len(),
+        );
         Self {
             layout: Arc::new(layout),
             ctx: Arc::new(CallbackCtx { callbacks }),
             atomic_data: Arc::new(Mutex::new(HashMap::new())),
             stream_mutex: Arc::new(Mutex::new(())),
+            stats: Arc::new(DirStats {
+                dir_id,
+                read_count: AtomicU64::new(0),
+                read_bytes: AtomicU64::new(0),
+                read_ns: AtomicU64::new(0),
+                lock_wait_ns: AtomicU64::new(0),
+            }),
         }
     }
 
+    /// [PROF_FFI] L0: dir_id for correlating reader_new / search lines back
+    /// to the dir_drop summary.
+    pub(crate) fn dir_id(&self) -> u64 {
+        self.stats.dir_id
+    }
+
     /// Perform an FFI pread. Serialized via `stream_mutex` (V3 invariant).
+    /// [PROF_FFI] L0: timing split into lock-wait vs. callback execution so
+    /// dir_drop can attribute mutex contention separately from raw IO.
     fn pread(&self, offset: u64, len: usize) -> io::Result<Vec<u8>> {
+        let t_wait = Instant::now();
         let _guard = self.stream_mutex.lock().map_err(|e| {
             io::Error::new(io::ErrorKind::Other, format!("stream_mutex poisoned: {e}"))
         })?;
+        let lock_wait_ns = t_wait.elapsed().as_nanos() as u64;
+
+        let t_io = Instant::now();
         let mut buf = vec![0u8; len];
         // Calling extern "C" fn pointer — safe from Rust's POV (ABI is C);
         // the contract safety (ctx validity, buffer ownership) is on the C++ side.
         let rc =
             (self.ctx.callbacks.read_at)(self.ctx.callbacks.ctx, offset, len, buf.as_mut_ptr());
+        let io_ns = t_io.elapsed().as_nanos() as u64;
+
+        self.stats.read_count.fetch_add(1, Ordering::Relaxed);
+        self.stats.read_bytes.fetch_add(len as u64, Ordering::Relaxed);
+        self.stats.read_ns.fetch_add(io_ns, Ordering::Relaxed);
+        self.stats.lock_wait_ns.fetch_add(lock_wait_ns, Ordering::Relaxed);
+
         if rc != 0 {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -494,5 +556,29 @@ mod tests {
         let (dir, _backend) = build_mock_directory(vec![0u8; 100], entries);
         let names = dir.file_names();
         assert_eq!(names, vec!["a.meta", "m.term", "z.idx"]);
+    }
+
+    // [PROF_FFI] L0: verify the per-directory IO counters increment, dir_id
+    // is unique across constructions, and Drop fires once even with clones.
+    #[test]
+    fn prof_ffi_counters_track_pread_activity() {
+        let data: Vec<u8> = (0..1000).map(|i| (i % 256) as u8).collect();
+        let entries = vec![("blob".to_string(), 0, 1000)];
+        let (dir, _backend) = build_mock_directory(data, entries);
+
+        let id_a = dir.dir_id();
+        let stats = dir.stats.clone();
+        assert_eq!(stats.read_count.load(Ordering::Relaxed), 0);
+
+        let handle = dir.get_file_handle(Path::new("blob")).unwrap();
+        let _ = handle.read_bytes(0..100).unwrap();
+        let _ = handle.read_bytes(100..250).unwrap();
+
+        assert_eq!(stats.read_count.load(Ordering::Relaxed), 2);
+        assert_eq!(stats.read_bytes.load(Ordering::Relaxed), 100 + 150);
+        assert!(stats.read_ns.load(Ordering::Relaxed) > 0);
+
+        let (dir2, _backend2) = build_mock_directory(vec![0u8; 10], vec![]);
+        assert_ne!(dir2.dir_id(), id_a, "dir_id must be unique per construction");
     }
 }

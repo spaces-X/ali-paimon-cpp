@@ -19,6 +19,7 @@
 
 use std::ffi::{c_char, CStr};
 use std::path::Path;
+use std::time::Instant;
 
 use croaring::{Portable, Treemap};
 use tantivy::collector::{Collector, SegmentCollector};
@@ -70,6 +71,10 @@ pub struct PaimonTantivyReader {
     /// index's schema (read from `meta.json` at construction time). Query-side
     /// tokenization looks this up in `index.tokenizers()` every time
     tokenizer_name: String,
+    /// [PROF_FFI] L0 correlation: dir_id of the backing PaimonCallbackDirectory,
+    /// captured at construction. Logged in every search line so operators can
+    /// match `search` → `dir_drop` summaries across query boundaries.
+    dir_id: u64,
 }
 
 impl PaimonTantivyReader {
@@ -82,10 +87,17 @@ impl PaimonTantivyReader {
         with_position: bool,
         dict_dir: &Path,
     ) -> Result<Self, String> {
+        // [PROF_FFI] L0: capture dir_id before Index::open consumes `directory`.
+        let dir_id = directory.dir_id();
+        let t_total = Instant::now();
+
+        let t = Instant::now();
         let index = Index::open(directory)
             .map_err(|e| format!("tantivy::Index::open: {e}"))?;
+        let open_ms = t.elapsed().as_secs_f64() * 1000.0;
 
         // Resolve fields by their fixed names (B1: schema is `row_id` + `text`).
+        let t_schema = Instant::now();
         let schema = index.schema();
         let text_field = schema.get_field(PAIMON_TEXT_FIELD_NAME).map_err(|e| {
             format!("tantivy index missing '{PAIMON_TEXT_FIELD_NAME}' field: {e}")
@@ -138,17 +150,28 @@ impl PaimonTantivyReader {
             ));
         }
 
+        let schema_ms = t_schema.elapsed().as_secs_f64() * 1000.0;
+
+        let t = Instant::now();
         let reader = index
             .reader_builder()
             .reload_policy(ReloadPolicy::Manual)
             .try_into()
             .map_err(|e| format!("build IndexReader: {e}"))?;
+        let reader_build_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let total_ms = t_total.elapsed().as_secs_f64() * 1000.0;
+        log::info!(
+            "[PROF_FFI] reader_new dir_id={} open_ms={:.2} schema_ms={:.2} reader_build_ms={:.2} total_ms={:.2} tokenizer={}",
+            dir_id, open_ms, schema_ms, reader_build_ms, total_ms, tokenizer_name,
+        );
 
         Ok(Self {
             index,
             reader,
             text_field,
             tokenizer_name,
+            dir_id,
         })
     }
 
@@ -822,8 +845,24 @@ pub unsafe extern "C" fn paimon_tantivy_reader_search(
     let limit_opt: Option<usize> = if limit < 0 { None } else { Some(limit as usize) };
     let min_score_opt: Option<f32> = if min_score > 0.0 { Some(min_score) } else { None };
 
-    match r.search_with_limit_and_filter(st, query_str, with_score, limit_opt, pre_filter.as_ref(), min_score_opt)
-    {
+    // [PROF_FFI] L0: wrap the whole tantivy search at the FFI surface so the
+    // dir_id ↔ search ↔ dir_drop log lines line up for offline attribution.
+    let dir_id = r.dir_id;
+    let t_search = Instant::now();
+    let search_result =
+        r.search_with_limit_and_filter(st, query_str, with_score, limit_opt, pre_filter.as_ref(), min_score_opt);
+    let search_total_ms = t_search.elapsed().as_secs_f64() * 1000.0;
+    let (hits, ok) = match &search_result {
+        Ok(v) => (v.len() as u64, true),
+        Err(_) => (0, false),
+    };
+    log::info!(
+        "[PROF_FFI] search dir_id={} stype={} with_score={} limit={} qlen={} prefilter_len={} total_ms={:.2} hits={} ok={}",
+        dir_id, search_type, with_score, limit, query_len, pre_filter_len,
+        search_total_ms, hits, ok,
+    );
+
+    match search_result {
         Ok(rows) => {
             // v0.2: has_scores is decoupled from limit — it equals with_score directly.
             let has_scores = with_score;

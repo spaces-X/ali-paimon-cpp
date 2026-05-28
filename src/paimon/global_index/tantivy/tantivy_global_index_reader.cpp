@@ -10,6 +10,7 @@
 
 #include "paimon/global_index/tantivy/tantivy_global_index_reader.h"
 
+#include <chrono>  // [PROF_FFI]
 #include <cstdlib>
 #include <cstring>
 #include <memory>
@@ -17,6 +18,7 @@
 #include <vector>
 
 #include "fmt/format.h"
+#include "glog/logging.h"  // [PROF_FFI]
 #include "paimon/common/utils/options_utils.h"
 #include "paimon/global_index/bitmap_global_index_result.h"
 #include "paimon/common/utils/rapidjson_util.h"
@@ -62,6 +64,11 @@ Result<std::shared_ptr<TantivyGlobalIndexReader>> TantivyGlobalIndexReader::Crea
     (void)field_name;  // Rust-side knows the field via the schema embedded in meta.json
     EnsureTantivyLogBridge();  // [BUG_QPLEAK_RUST]
 
+    // [PROF_FFI] L0: time the C++-side Create() so we can attribute
+    // GetInputStream + ParseArchiveHeader separately from the Rust-side
+    // Index::open / reader_builder (those are logged from reader.rs).
+    const auto t_create_start = std::chrono::steady_clock::now();
+
     std::map<std::string, std::string> write_options;
     if (io_meta.metadata) {
         PAIMON_RETURN_NOT_OK(RapidJsonUtil::FromJsonString(
@@ -95,9 +102,18 @@ Result<std::shared_ptr<TantivyGlobalIndexReader>> TantivyGlobalIndexReader::Crea
     //   4) build PaimonStreamCallbacks → paimon_tantivy_reader_new_streaming
     // Archive payloads are read lazily through read_at callbacks as tantivy
     // accesses posting lists, meta.json, etc.
+    const auto t_stream = std::chrono::steady_clock::now();
     PAIMON_ASSIGN_OR_RAISE(std::shared_ptr<InputStream> stream,
                            file_reader->GetInputStream(io_meta.file_path));
+    const double get_stream_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_stream)
+            .count();
+
+    const auto t_header = std::chrono::steady_clock::now();
     PAIMON_ASSIGN_OR_RAISE(ArchiveLayout layout, ParseArchiveHeader(stream.get()));
+    const double parse_header_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_header)
+            .count();
 
     // Transfer stream ownership to a heap-allocated StreamCtx; Rust will
     // `paimon_cpp_stream_release(ctx)` on reader drop, which `delete`s it.
@@ -115,6 +131,7 @@ Result<std::shared_ptr<TantivyGlobalIndexReader>> TantivyGlobalIndexReader::Crea
         name_ptrs.push_back(n.c_str());
     }
 
+    const auto t_ffi_new = std::chrono::steady_clock::now();
     PaimonTantivyReader* raw = nullptr;
     ::PaimonTantivyStatus st = paimon_tantivy_reader_new_streaming(
         name_ptrs.data(),
@@ -126,12 +143,24 @@ Result<std::shared_ptr<TantivyGlobalIndexReader>> TantivyGlobalIndexReader::Crea
         /*with_position=*/!omit_term_freq_and_positions,
         dict_dir.c_str(),
         &raw);
+    const double ffi_new_ms =
+        std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_ffi_new)
+            .count();
     if (st != PAIMON_TANTIVY_STATUS_OK) {
         // On failure, Rust did NOT take ownership of ctx (FFI contract):
         // release it here so the stream doesn't leak.
         paimon_cpp_stream_release(stream_ctx);
         PAIMON_TANTIVY_RETURN_NOT_OK(st);
     }
+    const double create_total_ms = std::chrono::duration<double, std::milli>(
+                                       std::chrono::steady_clock::now() - t_create_start)
+                                       .count();
+    LOG(INFO) << "[PROF_FFI] create archive=" << io_meta.file_path
+              << " file_count=" << layout.count
+              << " get_stream_ms=" << get_stream_ms
+              << " parse_header_ms=" << parse_header_ms
+              << " ffi_new_ms=" << ffi_new_ms
+              << " total_ms=" << create_total_ms;
     return std::shared_ptr<TantivyGlobalIndexReader>(
         new TantivyGlobalIndexReader(ReaderPtr(raw), pool));
 }
