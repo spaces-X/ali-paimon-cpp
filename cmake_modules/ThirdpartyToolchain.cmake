@@ -1822,5 +1822,9 @@ endif()
 if(PAIMON_ENABLE_LUCENE)
     build_boost()
     build_lucene()
+endif()
+# jieba (dict + headers) is needed by BOTH lucene-fts and the tantivy jieba
+# tokenizer; build it whenever either backend is on, not only under lucene.
+if(PAIMON_ENABLE_LUCENE OR PAIMON_ENABLE_TANTIVY)
     build_jieba()
 endif()

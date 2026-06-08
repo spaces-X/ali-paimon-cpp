@@ -10,7 +10,8 @@
 
 #include "paimon/global_index/tantivy/tantivy_global_index_reader.h"
 
-#include <chrono>  // [PROF_FFI]
+#include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <memory>
